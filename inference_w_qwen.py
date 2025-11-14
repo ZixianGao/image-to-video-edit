@@ -6,8 +6,8 @@ from torchvision.transforms import v2
 from einops import rearrange
 import lightning as pl
 import pandas as pd
-from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict, WanVideoPipeline,save_video
-from diffsynth.models.wan_mix_transformers import VAP_MoT
+from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict, save_video
+from diffsynth.pipelines.wan_video_vsp import WanVideoPipeline
 from diffusers import QwenImageEditPipeline
 import torchvision
 from PIL import Image
@@ -156,24 +156,35 @@ class TextVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.path)
 
+class LayerAdapter(nn.Module):
+    """Simple linear adapter + optional LayerNorm to map between dims."""
+    def __init__(self, in_dim: int, out_dim: int, use_norm: bool = True):
+        super().__init__()
+        self.lin = nn.Linear(in_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim) if use_norm else nn.Identity()
+
+    def forward(self, x: torch.Tensor):
+        return self.norm(self.lin(x))
+
+
 def parse_args(): 
     parser = argparse.ArgumentParser(description="ReCamMaster Inference")
     parser.add_argument(
         "--dataset_path",
         type=str,
-        default="/data/nvme1/gao/dataset_root",
+        default="/work/gj40/j40001/code/image-to-video-edit/dataset_root",
         help="The path of the Dataset.",
     )
     parser.add_argument(
         "--ckpt_path",
         type=str,
-        default="/data1/gao/video_edit/checkpoint/lightning_logs/version_1/checkpoints/step66000.safetensors",
+        default="/work/gj40/j40001/code/image-to-video-edit/checkpoint_with_qwen/lightning_logs/version_0/checkpoints/step2000.ckpt",
         help="Path to save the model.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results_full__66000",
+        default="./results_with_qwen",
         help="Path to save the results.",
     )
     parser.add_argument(
@@ -195,15 +206,19 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def print_memory(tag=""):
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"[{tag}] CUDA allocated: {allocated:.2f} GB | reserved: {reserved:.2f} GB")
 
 if __name__ == '__main__':
     args = parse_args()
-    qwen_pipe = QwenImageEditPipeline.from_pretrained("/data/nvme1/gao/qwen_image_edit").to(torch.bfloat16) .to("cuda:0")
-    qwen = qwen_pipe.transformer.to(dtype=torch.bfloat16).to(device="cuda")
-    prepare_latents_fn = qwen_pipe.prepare_latents
-    encode_prompt = qwen_pipe.encode_prompt
-    vae_scale_factor = qwen_pipe.vae_scale_factor
-    del qwen_pipe
+    qwen_pipe = QwenImageEditPipeline.from_pretrained("/work/gj40/j40001/code/image-to-video-edit/qwen_image_edit",torch_dtype=torch.bfloat16,device="cuda")
+    qwen_pipe.set_progress_bar_config(disable=None)
+    qwen_pipe.to(torch.bfloat16)
+    qwen_pipe.to("cuda")
+    print_memory("After loading Qwen pipeline")
+
     # 1. 加载原始 pipeline（与训练完全一致）
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     # model_manager.load_models([
@@ -212,34 +227,23 @@ if __name__ == '__main__':
     #     "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
     # ])
     model_manager.load_models([
-       "/data/nvme1/gao/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
-        "/data/nvme1/gao/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-        "/data/nvme1/gao/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+       "/work/gj40/j40001/code/image-to-video-edit/models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
+        "/work/gj40/j40001/code/image-to-video-edit/models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+        "/work/gj40/j40001/code/image-to-video-edit/models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
     ])
-    model_manager.to(device="cuda")
+
 
     # for name, model in model_manager.model:
     #     model.to(device=device, dtype=torch.bfloat16)
     pipe = WanVideoPipeline.from_model_manager(model_manager, device="cuda")
-    wan = pipe.dit
+    pipe.dit.expert2backbone = LayerAdapter(3072, 1536)
 
-    pipe.dit = VAP_MoT(backbone=wan, expert=qwen,prepare_latents_fn=prepare_latents_fn,encode_prompt =encode_prompt, vae_scale_factor = vae_scale_factor,cross_attn_heads=8, temporal_bias_delta=8).to("cuda").to(dtype=torch.bfloat16)
-    del qwen
-    del wan
-    pipe.scheduler.set_timesteps(1000, training=True)
-    pipe.dit.eval()
+    state_dict = torch.load(args.ckpt_path, map_location="cpu")
+    pipe.dit.load_state_dict(state_dict, strict=True)
+    pipe.to("cuda")
+    pipe.to(dtype=torch.bfloat16)
     
-    # # 2. 获取原始 denoising model
-    # dit = pipe.dit
-
-    # # 3. 加载 checkpoint
-    # state_dict = torch.load(args.ckpt_path, map_location="cuda")
-    # dit.load_state_dict(state_dict)
-
-    # # 4. 替换 pipeline
-    # pipe.dit = dit.to("cuda").eval()
-
-    # source_video
+    print_memory("After WanVideoPipeline loaded")
 
     # 5. dataset
     dataset = TextVideoDataset(
@@ -258,10 +262,28 @@ if __name__ == '__main__':
         target_text = batch["text"]
         source_video = batch["video"]
         file_name = os.path.basename(batch['path'][0])
+        image = Image.open(batch['path'][0]).convert("RGB")
         # target_camera = batch["camera"]
-
+        #qwen
+        inputs = {
+            "image": image,
+            "prompt": target_text,
+            "generator": torch.manual_seed(0),
+            "true_cfg_scale": 4.0,
+            "negative_prompt": " ",
+            "num_inference_steps": 50,
+        }
+        print("Grad enabled:", torch.is_grad_enabled())
+        print("CUDNN benchmark:", torch.backends.cudnn.benchmark)
+        print("CUDNN deterministic:", torch.backends.cudnn.deterministic)
+        print("Memory allocated:", torch.cuda.memory_allocated() / 1024**3, "GB")
+        print("Memory reserved:", torch.cuda.memory_reserved() / 1024**3, "GB")
+        with torch.inference_mode():
+            output,ref_latent = qwen_pipe(**inputs,return_dict=False)
+        # breakpoint()
         video = pipe(
             prompt=target_text,
+            ref_latent=ref_latent[-30:],
             negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
             source_video=source_video,
             cfg_scale=args.cfg_scale,

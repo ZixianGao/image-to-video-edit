@@ -4,7 +4,7 @@ from typing import Optional, Tuple, List, Any, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffsynth import ModelManager, load_state_dict, WanVideoPipeline,save_video
+# from diffsynth import ModelManager, load_state_dict, WanVideoPipeline,save_video
 from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
 from diffusers import QwenImageEditPipeline
 from torchvision.transforms.functional import to_pil_image
@@ -87,30 +87,14 @@ class VAP_MoT(nn.Module):
         if self.expert_dim is None:
             raise ValueError("Expert must expose attribute .inner_dim (e.g., QwenImageTransformer2DModel.inner_dim)")
 
-        # heads: choose cross-attention head count
-        if cross_attn_heads is None:
-            # choose as min of both models' head counts (heuristic)
-            # estimate backbone head count if possible
-            backbone_heads = getattr(backbone, "blocks", None)
-            # safe default:
-            cross_attn_heads = 8
-        self.cross_attn_heads = cross_attn_heads
 
         # Adapters for mapping token dims for cross-attention
         # expert -> backbone space (used when backbone queries expert)
         self.expert2backbone = LayerAdapter(self.expert_dim, self.backbone_dim)
         # backbone -> expert space (used when expert queries backbone)
-        self.backbone2expert = LayerAdapter(self.backbone_dim, self.expert_dim)
+        # self.backbone2expert = LayerAdapter(self.backbone_dim, self.expert_dim)
 
 
-        # temporal bias vector: a small learned vector added to expert->backbone tokens to simulate time-shifted RoPE effect
-        self.temporal_bias_delta = temporal_bias_delta
-        # small MLP to produce a bias token vector in backbone dim per time offset
-        self.temporal_bias_mlp = nn.Sequential(
-            nn.Linear(1, self.backbone_dim),
-            nn.GELU(),
-            nn.Linear(self.backbone_dim, self.backbone_dim)
-        )
 
         # metadata
         self.backbone_layers = len(self.backbone.blocks)
@@ -190,8 +174,8 @@ class VAP_MoT(nn.Module):
             if isinstance(ref_text_tokens[0], str):
                 # 如果是字符串，用 encode_prompt
                 # prompt_image = to_pil_image(((ref_image_tokens.squeeze(0).squeeze(1).to(torch.float32) + 1) / 2).cpu())
-                prompt_image = ((ref_image_tokens.squeeze(0).squeeze(1) + 1) / 2).to("cuda")
-                ref_text_tokens, prompt_embeds_mask = self.encode_prompt(image = prompt_image, prompt =ref_text_tokens,prompt_embeds =None,prompt_embeds_mask = None,device=torch.device("cuda"),num_images_per_prompt=1,max_sequence_length=512)
+                prompt_image = (ref_image_tokens.squeeze(0).squeeze(1) + 1) / 2
+                ref_text_tokens, prompt_embeds_mask = self.encode_prompt(prompt =ref_text_tokens,image = prompt_image,device=torch.device("cuda"),num_images_per_prompt=1,prompt_embeds =None,prompt_embeds_mask = None,max_sequence_length=512)
             ref_text_tokens, prompt_embeds_mask = ref_text_tokens.to("cuda"), prompt_embeds_mask.to("cuda")
             enc = self.expert.txt_norm(ref_text_tokens)
             enc = self.expert.txt_in(enc)
@@ -290,14 +274,6 @@ if __name__ == "__main__":
 
     # # Build Mixture-of-Transformers wrapper
     # mot = VAP_MoT(backbone=wan, expert=qwen, cross_attn_heads=8, temporal_bias_delta=8).to(device="cuda").to(dtype=torch.bfloat16)
-    qwen_pipe = QwenImageEditPipeline.from_pretrained("/data/nvme1/gao/qwen_image_edit").to(torch.bfloat16) .to("cuda:0")
-    qwen = qwen_pipe.transformer.to(dtype=torch.bfloat16).to(device="cuda")
-    prepare_latents_fn = qwen_pipe.prepare_latents
-    encode_prompt = qwen_pipe.encode_prompt
-    vae_scale_factor = qwen_pipe.vae_scale_factor
-
-    del qwen_pipe 
- 
     model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_manager.load_models([
         "/data/nvme1/gao/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
@@ -309,11 +285,14 @@ if __name__ == "__main__":
     wan = WanVideoPipeline.from_model_manager(model_manager, device="cpu").dit
 
     # 3. Qwen transformer 也只在 CPU
-
+    qwen_pipe = QwenImageEditPipeline.from_pretrained("/data/nvme1/gao/qwen_image_edit")
+    qwen = qwen_pipe.transformer.to(dtype=torch.bfloat16).to(device="cuda")
+    prepare_latents_fn = qwen_pipe.prepare_latents
+    encode_prompt = qwen_pipe.encode_prompt
     # 4. 创建 VAP_MoT，并一次性搬到 GPU
-    mot = VAP_MoT(backbone=wan, expert=qwen,prepare_latents_fn=prepare_latents_fn, encode_prompt=encode_prompt,vae_scale_factor=vae_scale_factor,cross_attn_heads=8, temporal_bias_delta=8).to("cuda").to(dtype=torch.bfloat16)
-
+    mot = VAP_MoT(backbone=wan, expert=qwen,prepare_latents_fn=prepare_latents_fn, encode_prompt=encode_prompt,cross_attn_heads=8, temporal_bias_delta=8).to("cuda").to(dtype=torch.bfloat16)
     del qwen
+
 
     # Prepare dummy inputs (replace with your real tensors)
     B = 1
@@ -347,9 +326,10 @@ if __name__ == "__main__":
         out_video = mot(
             ref_image_tokens=ref_image_tokens,
             ref_img_shapes=ref_img_shapes,
-            ref_text_tokens="please change its colour.",
+            ref_text_tokens=ref_text_tokens,
             target_video=target_video,
             target_timestep=target_timestep,
             target_text_tokens=target_text_tokens,
+            ref_text_shapes = ref_text_shapes,
         )
         print("out_video shape:", out_video.shape)

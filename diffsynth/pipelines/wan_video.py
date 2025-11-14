@@ -1,6 +1,5 @@
 from ..models import ModelManager
 from ..models.wan_video_dit import WanModel
-from ..models.wan_mix_transformers import VAP_MoT
 from ..models.wan_video_text_encoder import WanTextEncoder
 from ..models.wan_video_vae import WanVideoVAE
 from ..models.wan_video_image_encoder import WanImageEncoder
@@ -33,7 +32,6 @@ class WanVideoPipeline(BasePipeline):
         self.image_encoder: WanImageEncoder = None
         self.dit: WanModel = None
         self.vae: WanVideoVAE = None
-        self.ref_model = QwenImageEditPipeline.from_pretrained("/data/nvme1/gao/qwen_image_edit")
         self.model_names = ['text_encoder', 'dit', 'vae', 'ref_model']
         self.height_division_factor = 16
         self.width_division_factor = 16
@@ -229,7 +227,6 @@ class WanVideoPipeline(BasePipeline):
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-
         # ------------------------------------------------------------------ 
         # 2. Scheduler 设置
         # ------------------------------------------------------------------
@@ -274,7 +271,7 @@ class WanVideoPipeline(BasePipeline):
             source_video = source_video.to(dtype=self.torch_dtype, device=self.device)
             source_latents = self.encode_video(source_video, **tiler_kwargs).to(
                 dtype=self.torch_dtype, device=self.device)
-            source_img = source_video[0].unsqueeze(0)
+            source_img = source_video[:, :, 0:1, :, :]
             
         else:
             source_latents = torch.zeros_like(latents)
@@ -319,7 +316,6 @@ class WanVideoPipeline(BasePipeline):
         # ------------------------------------------------------------------
         self.load_models_to_device(["dit"])
         tgt_latent_length = latents.shape[2]
-
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
@@ -568,7 +564,7 @@ def model_fn_wan_video(
     Wrapper to map previous model_fn_wan_video interface to new forward
     """
     # 调用新的 forward
-    x_out = model.forward(
+    x_out = model(
         ref_image_tokens=ref_image_tokens,
         ref_img_shapes=ref_img_shapes,
         ref_text_tokens=ref_text_tokens,

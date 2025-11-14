@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional, Tuple, List, Any, Dict
+
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
@@ -156,7 +158,6 @@ class SelfAttention(nn.Module):
 
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
-
         if expert_token is not None:
             # k_expert = self.k(expert_token)
             k_expert = self.norm_k(self.k(expert_token))
@@ -362,6 +363,8 @@ class WanModel(torch.nn.Module):
         else:
             self.control_adapter = None
 
+
+
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
         if self.control_adapter is not None and control_camera_latents_input is not None:
@@ -380,6 +383,7 @@ class WanModel(torch.nn.Module):
         )
 
     def forward(self,
+                ref_image_latents: List,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
                 context: torch.Tensor,
@@ -393,7 +397,6 @@ class WanModel(torch.nn.Module):
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-        
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
@@ -412,23 +415,30 @@ class WanModel(torch.nn.Module):
                 return module(*inputs)
             return custom_forward
 
-        for block in self.blocks:
+        for idx, block in enumerate(self.blocks):
+            if ref_image_latents is not None:
+                hidden_expert_to_back = ref_image_latents[idx]
+                expert_mapped_to_back = self.expert2backbone(hidden_expert_to_back)
+            else: 
+                expert_mapped_to_back = None
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
                             x, context, t_mod, freqs,
+                            expert_token=expert_mapped_to_back,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, t_mod, freqs,
+                        expert_token=expert_mapped_to_back,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, expert_token=expert_mapped_to_back)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

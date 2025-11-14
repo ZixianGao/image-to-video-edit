@@ -74,9 +74,9 @@ class VAP_MoT(nn.Module):
         self.prepare_latents_fn = prepare_latents_fn
         self.encode_prompt = encode_prompt
         self.vae_scale_factor =vae_scale_factor
-        # freeze backbone parameters
-        for p in self.backbone.parameters():
-            p.requires_grad = False
+        # # freeze backbone parameters
+        # for p in self.backbone.parameters():
+        #     p.requires_grad = False
 
         # dims
         self.backbone_dim = getattr(backbone, "dim", None)
@@ -87,30 +87,14 @@ class VAP_MoT(nn.Module):
         if self.expert_dim is None:
             raise ValueError("Expert must expose attribute .inner_dim (e.g., QwenImageTransformer2DModel.inner_dim)")
 
-        # heads: choose cross-attention head count
-        if cross_attn_heads is None:
-            # choose as min of both models' head counts (heuristic)
-            # estimate backbone head count if possible
-            backbone_heads = getattr(backbone, "blocks", None)
-            # safe default:
-            cross_attn_heads = 8
-        self.cross_attn_heads = cross_attn_heads
 
         # Adapters for mapping token dims for cross-attention
         # expert -> backbone space (used when backbone queries expert)
         self.expert2backbone = LayerAdapter(self.expert_dim, self.backbone_dim)
         # backbone -> expert space (used when expert queries backbone)
-        self.backbone2expert = LayerAdapter(self.backbone_dim, self.expert_dim)
+        # self.backbone2expert = LayerAdapter(self.backbone_dim, self.expert_dim)
 
 
-        # temporal bias vector: a small learned vector added to expert->backbone tokens to simulate time-shifted RoPE effect
-        self.temporal_bias_delta = temporal_bias_delta
-        # small MLP to produce a bias token vector in backbone dim per time offset
-        self.temporal_bias_mlp = nn.Sequential(
-            nn.Linear(1, self.backbone_dim),
-            nn.GELU(),
-            nn.Linear(self.backbone_dim, self.backbone_dim)
-        )
 
         # metadata
         self.backbone_layers = len(self.backbone.blocks)
@@ -137,6 +121,7 @@ class VAP_MoT(nn.Module):
         clip_feature: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
         use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
         **kwargs
     ):
         """
@@ -150,7 +135,6 @@ class VAP_MoT(nn.Module):
         - clip_feature, y: optional WanModel args (same semantics as WanModel.forward)
         """
         B = ref_image_tokens.shape[0]
-
         # --- Prepare backbone side (WanModel) ---
         # Compute time embeddings and patchify target video exactly like WanModel.forward
         t = self.backbone.time_embedding(sinusoidal_embedding_1d(self.backbone.freq_dim, target_timestep))
@@ -168,7 +152,8 @@ class VAP_MoT(nn.Module):
             backbone_context = torch.cat([clip_embdding, backbone_context], dim=1)
 
         # patchify target video
-        backbone_tokens, grid = self.backbone.patchify(target_video, control_camera_latents_input=y)  # (B, N_t, D_back)
+        backbone_tokens, grid = self.backbone.patchify(target_video)
+        # backbone_tokens, grid = self.backbone.patchify(target_video, control_camera_latents_input=y)  # (B, N_t, D_back)
         f, h, w = grid
         # freqs used in WanModel -- we re-create using backbone.freqs (precomputed) to be consistent
         freqs = torch.cat([
@@ -191,11 +176,11 @@ class VAP_MoT(nn.Module):
                 # 如果是字符串，用 encode_prompt
                 # prompt_image = to_pil_image(((ref_image_tokens.squeeze(0).squeeze(1).to(torch.float32) + 1) / 2).cpu())
                 prompt_image = (ref_image_tokens.squeeze(0).squeeze(1) + 1) / 2
-                ref_text_tokens, prompt_embeds_mask = self.encode_prompt(image = prompt_image, prompt =ref_text_tokens,prompt_embeds =None,prompt_embeds_mask = None,device=torch.device("cuda"),num_images_per_prompt=1,max_sequence_length=512)
+                ref_text_tokens, prompt_embeds_mask = self.encode_prompt(prompt =ref_text_tokens,image = prompt_image,device=torch.device("cuda"),num_images_per_prompt=1,prompt_embeds =None,prompt_embeds_mask = None,max_sequence_length=512)
             ref_text_tokens, prompt_embeds_mask = ref_text_tokens.to("cuda"), prompt_embeds_mask.to("cuda")
             enc = self.expert.txt_norm(ref_text_tokens)
             enc = self.expert.txt_in(enc)
-            encoder_hidden_states = enc
+            encoder_hidden_states = enc 
             # except Exception:
             #     encoder_hidden_states = ref_text_tokens  # pass as-is as fallback
         device = torch.device("cuda")
@@ -229,36 +214,59 @@ class VAP_MoT(nn.Module):
         max_layers = max(self.backbone_layers, self.expert_layers)
 
 
-
-        for idx in range(max_layers):
-            # --- expert block step (if present) ---
-            if idx < self.expert_layers:
-                block = self.expert.transformer_blocks[idx]
-                # Qwen block has signature: block(...)-> (encoder_hidden_states, hidden_states)
-                # many blocks accept image_rotary_emb, temb, etc.
-                try:
-                    encoder_hidden_states, hidden_states_expert = block(
-                        hidden_states=hidden_states_expert,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_hidden_states_mask=prompt_embeds_mask,
-                        temb=temb,
-                        image_rotary_emb=image_rotary_emb,
-                        joint_attention_kwargs=None,
-                    )
-                except TypeError:
-                    # fallback: call block only with hidden_states (best-effort)
-                    hidden_states_expert = block(hidden_states_expert)
+        expert_states = []
+        for idx in range(self.expert_layers):
+            block = self.expert.transformer_blocks[idx]
+            try:
+                encoder_hidden_states, hidden_states_expert = block(
+                    hidden_states=hidden_states_expert,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    joint_attention_kwargs=None,
+                )
+            except TypeError:
+                hidden_states_expert = block(hidden_states_expert)
+            
+            # 保存每一层输出
+            expert_states.append(hidden_states_expert)
             # else expert skip -> keep previous expert tokens
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+            return custom_forward
+        breakpoint()
+        for idx in range(self.backbone_layers):
+            bblock = self.backbone.blocks[idx]
 
-            # --- backbone block step (if present) ---
-            expert_mapped_to_back = self.expert2backbone(hidden_states_expert) if hidden_states_expert is not None else None
-            if idx < self.backbone_layers:
-                bblock = self.backbone.blocks[idx]
-                # Wan's block signature: block(x, context, t_mod, freqs)
-                try:
-                    backbone_tokens = bblock(backbone_tokens, backbone_context, t_mod, freqs,expert_token=expert_mapped_to_back)
-                except TypeError:
-                    backbone_tokens = bblock(backbone_tokens, backbone_context, t_mod, freqs)
+            # 映射专家后半部分
+            expert_idx = idx + (self.expert_layers - self.backbone_layers)  # 31-60 层
+            hidden_expert_to_back = expert_states[expert_idx]
+            expert_mapped_to_back = self.expert2backbone(hidden_expert_to_back)
+
+            try:
+                # backbone_tokens = bblock(backbone_tokens, backbone_context, t_mod, freqs, expert_token=expert_mapped_to_back)
+                if self.training and use_gradient_checkpointing:
+                    if use_gradient_checkpointing_offload:
+                        with torch.autograd.graph.save_on_cpu():
+                            backbone_tokens = torch.utils.checkpoint.checkpoint(
+                                create_custom_forward(bblock),
+                                backbone_tokens, backbone_context, t_mod, freqs,
+                                expert_token=expert_mapped_to_back,
+                                use_reentrant=False,
+                            )
+                    else:
+                        backbone_tokens = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(bblock),
+                            backbone_tokens, backbone_context, t_mod, freqs,
+                            expert_token=expert_mapped_to_back,
+                            use_reentrant=False,
+                        )
+                else:
+                    backbone_tokens = bblock(backbone_tokens, backbone_context, t_mod, freqs, expert_token=expert_mapped_to_back)
+            except TypeError:
+                backbone_tokens = bblock(backbone_tokens, backbone_context, t_mod, freqs)
 
 
         # --- final backbone head to produce video output ---
